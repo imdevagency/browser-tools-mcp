@@ -1,25 +1,28 @@
 #!/usr/bin/env node
 
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import { tokenizeAndEstimateCost } from "llm-cost";
-import { WebSocketServer, WebSocket } from "ws";
-import fs from "fs";
-import path from "path";
-import { IncomingMessage } from "http";
-import { Socket } from "net";
-import os from "os";
-import { exec } from "child_process";
+import express from 'express';
+import type { Request, Response, Application } from 'express';
+import type { Server } from 'http';
+import cors from 'cors';
+import type { CorsOptions } from 'cors';
+import bodyParser from 'body-parser';
+import { tokenizeAndEstimateCost } from 'llm-cost';
+import { WebSocketServer, WebSocket } from 'ws';
+import fs from 'node:fs';
+import path from 'node:path';
+import { IncomingMessage } from 'node:http';
+import { Socket } from 'node:net';
+import os from 'node:os';
+import { exec } from 'node:child_process';
 import {
   runPerformanceAudit,
   runAccessibilityAudit,
   runSEOAudit,
   AuditCategory,
   LighthouseReport,
-} from "./lighthouse/index.js";
-import * as net from "net";
-import { runBestPracticesAudit } from "./lighthouse/best-practices.js";
+} from './lighthouse/index.js';
+import * as net from 'node:net';
+import { runBestPracticesAudit } from './lighthouse/best-practices.js';
 
 /**
  * Converts a file path to the appropriate format for the current platform
@@ -184,54 +187,54 @@ const screenshotCallbacks = new Map<string, ScreenshotCallback>();
 // Function to get available port starting with the given port
 async function getAvailablePort(
   startPort: number,
-  maxAttempts: number = 10
+  maxAttempts: number = 10,
+  host: string = "0.0.0.0"
 ): Promise<number> {
   let currentPort = startPort;
   let attempts = 0;
 
   while (attempts < maxAttempts) {
     try {
-      // Try to create a server on the current port
-      // We'll use a raw Node.js net server for just testing port availability
       await new Promise<void>((resolve, reject) => {
         const testServer = net.createServer();
 
-        // Handle errors (e.g., port in use)
         testServer.once("error", (err: any) => {
           if (err.code === "EADDRINUSE") {
             console.log(`Port ${currentPort} is in use, trying next port...`);
             currentPort++;
             attempts++;
-            resolve(); // Continue to next iteration
+            resolve();
           } else {
-            reject(err); // Different error, propagate it
+            reject(err);
           }
         });
 
-        // If we can listen, the port is available
         testServer.once("listening", () => {
-          // Make sure to close the server to release the port
           testServer.close(() => {
             console.log(`Found available port: ${currentPort}`);
+            // Save the port to a file for the MCP server to discover
+            try {
+              fs.writeFileSync(path.join(process.cwd(), ".port"), currentPort.toString());
+              fs.writeFileSync(path.join(process.cwd(), ".host"), host);
+              console.log(`Saved port ${currentPort} and host ${host} to configuration files`);
+            } catch (err) {
+              console.error("Error saving port configuration:", err);
+            }
             resolve();
           });
         });
 
-        // Try to listen on the current port
-        testServer.listen(currentPort, currentSettings.serverHost);
+        testServer.listen(currentPort, host);
       });
 
-      // If we reach here without incrementing the port, it means the port is available
       return currentPort;
     } catch (error: any) {
       console.error(`Error checking port ${currentPort}:`, error);
-      // For non-EADDRINUSE errors, try the next port
       currentPort++;
       attempts++;
     }
   }
 
-  // If we've exhausted all attempts, throw an error
   throw new Error(
     `Could not find an available port after ${maxAttempts} attempts starting from ${startPort}`
   );
@@ -242,9 +245,17 @@ const REQUESTED_PORT = parseInt(process.env.PORT || "3025", 10);
 let PORT = REQUESTED_PORT;
 
 // Create application and initialize middleware
-const app = express();
-app.use(cors());
-// Increase JSON body parser limit to 50MB to handle large screenshots
+const app: Application = express();
+
+// Configure CORS
+const corsOptions: CorsOptions = {
+  origin: true, // Allow all origins
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
+};
+
+app.use(cors(corsOptions));
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use(bodyParser.urlencoded({ limit: "50mb", extended: true }));
 
@@ -512,13 +523,14 @@ app.get("/.port", (req, res) => {
   res.send(PORT.toString());
 });
 
-// Add new identity endpoint with a unique signature
-app.get("/.identity", (req, res) => {
+// Add identity endpoint for MCP server discovery
+app.get("/.identity", (req: Request, res: Response): void => {
   res.json({
-    port: PORT,
-    name: "browser-tools-server",
-    version: "1.2.0",
     signature: "mcp-browser-connector-24x7",
+    version: "1.2.0",
+    status: "running",
+    port: PORT,
+    host: currentSettings.serverHost
   });
 });
 
@@ -1403,119 +1415,59 @@ export class BrowserConnector {
   }
 }
 
-// Use an async IIFE to allow for async/await in the initial setup
-(async () => {
+// Initialize the server with proper error handling
+async function initializeServer(): Promise<Server> {
   try {
-    console.log(`Starting Browser Tools Server...`);
-    console.log(`Requested port: ${REQUESTED_PORT}`);
-
-    // Find an available port
-    try {
-      PORT = await getAvailablePort(REQUESTED_PORT);
-
-      if (PORT !== REQUESTED_PORT) {
-        console.log(`\n====================================`);
-        console.log(`NOTICE: Requested port ${REQUESTED_PORT} was in use.`);
-        console.log(`Using port ${PORT} instead.`);
-        console.log(`====================================\n`);
-      }
-    } catch (portError) {
-      console.error(`Failed to find an available port:`, portError);
-      process.exit(1);
-    }
-
-    // Create the server with the available port
+    // Get an available port
+    PORT = await getAvailablePort(REQUESTED_PORT, 10, currentSettings.serverHost);
+    
+    // Start the server
     const server = app.listen(PORT, currentSettings.serverHost, () => {
-      console.log(`\n=== Browser Tools Server Started ===`);
-      console.log(
-        `Aggregator listening on http://${currentSettings.serverHost}:${PORT}`
-      );
-
-      if (PORT !== REQUESTED_PORT) {
-        console.log(
-          `NOTE: Using fallback port ${PORT} instead of requested port ${REQUESTED_PORT}`
-        );
-      }
-
-      // Log all available network interfaces for easier discovery
-      const networkInterfaces = os.networkInterfaces();
-      console.log("\nAvailable on the following network addresses:");
-
-      Object.keys(networkInterfaces).forEach((interfaceName) => {
-        const interfaces = networkInterfaces[interfaceName];
-        if (interfaces) {
-          interfaces.forEach((iface) => {
-            if (!iface.internal && iface.family === "IPv4") {
-              console.log(`  - http://${iface.address}:${PORT}`);
-            }
-          });
-        }
-      });
-
-      console.log(`\nFor local access use: http://localhost:${PORT}`);
+      console.log(`Browser Connector Server running on ${currentSettings.serverHost}:${PORT}`);
     });
 
-    // Handle server startup errors
-    server.on("error", (err: any) => {
-      if (err.code === "EADDRINUSE") {
-        console.error(
-          `ERROR: Port ${PORT} is still in use, despite our checks!`
-        );
-        console.error(
-          `This might indicate another process started using this port after our check.`
-        );
-      } else {
-        console.error(`Server error:`, err);
-      }
-      process.exit(1);
-    });
-
-    // Initialize the browser connector with the existing app AND server
-    const browserConnector = new BrowserConnector(app, server);
-
-    // Handle shutdown gracefully with improved error handling
-    process.on("SIGINT", async () => {
-      console.log("\nReceived SIGINT signal. Starting graceful shutdown...");
-
-      try {
-        // First shutdown WebSocket connections
-        await browserConnector.shutdown();
-
-        // Then close the HTTP server
-        await new Promise<void>((resolve, reject) => {
-          server.close((err) => {
-            if (err) {
-              console.error("Error closing HTTP server:", err);
-              reject(err);
-            } else {
-              console.log("HTTP server closed successfully");
-              resolve();
-            }
-          });
-        });
-
-        // Clear all logs
-        clearAllLogs();
-
-        console.log("Shutdown completed successfully");
-        process.exit(0);
-      } catch (error) {
-        console.error("Error during shutdown:", error);
-        // Force exit in case of error
+    // Add error handling
+    server.on("error", (error: Error) => {
+      if ((error as any).code === "EADDRINUSE") {
+        console.error(`Port ${PORT} is already in use. Please try a different port.`);
         process.exit(1);
+      } else {
+        console.error("Server error:", error);
       }
     });
 
-    // Also handle SIGTERM
+    // Handle graceful shutdown
     process.on("SIGTERM", () => {
-      console.log("\nReceived SIGTERM signal");
-      process.emit("SIGINT");
+      console.log("Received SIGTERM. Performing graceful shutdown...");
+      server.close(() => {
+        console.log("Server closed");
+        process.exit(0);
+      });
     });
+
+    process.on("SIGINT", () => {
+      console.log("Received SIGINT. Performing graceful shutdown...");
+      server.close(() => {
+        console.log("Server closed");
+        process.exit(0);
+      });
+    });
+
+    return server;
   } catch (error) {
-    console.error("Failed to start server:", error);
+    console.error("Failed to initialize server:", error);
     process.exit(1);
   }
-})().catch((err) => {
-  console.error("Unhandled error during server startup:", err);
+}
+
+// Initialize the server
+initializeServer().then((server: Server) => {
+  // Initialize the BrowserConnector with the server
+  const browserConnector = new BrowserConnector(app, server);
+
+  // Export the browserConnector instance if needed
+  (global as any).browserConnector = browserConnector;
+}).catch((error: Error) => {
+  console.error("Failed to start the server:", error);
   process.exit(1);
 });

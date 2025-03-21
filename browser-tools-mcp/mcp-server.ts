@@ -28,7 +28,7 @@ function getDefaultServerPort(): number {
 
   // Try to read from .port file
   try {
-    const portFilePath = path.join(__dirname, ".port");
+    const portFilePath = path.join(process.cwd(), ".port");
     if (fs.existsSync(portFilePath)) {
       const port = parseInt(fs.readFileSync(portFilePath, "utf8").trim(), 10);
       if (!isNaN(port) && port > 0) {
@@ -50,122 +50,163 @@ function getDefaultServerHost(): string {
     return process.env.BROWSER_TOOLS_HOST;
   }
 
+  // Try to read from .host file
+  try {
+    const hostFilePath = path.join(process.cwd(), ".host");
+    if (fs.existsSync(hostFilePath)) {
+      const host = fs.readFileSync(hostFilePath, "utf8").trim();
+      if (host) {
+        return host;
+      }
+    }
+  } catch (err) {
+    console.error("Error reading host file:", err);
+  }
+
   // Default to localhost
   return "127.0.0.1";
 }
 
-// Server discovery function - similar to what you have in the Chrome extension
+// Server discovery function with improved error handling and retry logic
 async function discoverServer(): Promise<boolean> {
   console.log("Starting server discovery process");
 
   // Common hosts to try
-  const hosts = [getDefaultServerHost(), "127.0.0.1", "localhost"];
+  const hosts = Array.from(new Set([getDefaultServerHost(), "127.0.0.1", "localhost"]));
 
   // Ports to try (start with default, then try others)
   const defaultPort = getDefaultServerPort();
-  const ports = [defaultPort];
+  const ports = new Set([defaultPort]);
 
   // Add additional ports (fallback range)
   for (let p = 3025; p <= 3035; p++) {
-    if (p !== defaultPort) {
-      ports.push(p);
-    }
+    ports.add(p);
   }
 
-  console.log(`Will try hosts: ${hosts.join(", ")}`);
-  console.log(`Will try ports: ${ports.join(", ")}`);
+  console.log(`Will try hosts: ${Array.from(hosts).join(", ")}`);
+  console.log(`Will try ports: ${Array.from(ports).join(", ")}`);
 
-  // Try to find the server
-  for (const host of hosts) {
-    for (const port of ports) {
-      try {
-        console.log(`Checking ${host}:${port}...`);
+  const maxRetries = 3;
+  const retryDelay = 1000; // 1 second
 
-        // Use the identity endpoint for validation
-        const response = await fetch(`http://${host}:${port}/.identity`, {
-          signal: AbortSignal.timeout(1000), // 1 second timeout
-        });
+  for (let retry = 0; retry < maxRetries; retry++) {
+    if (retry > 0) {
+      console.log(`Retry attempt ${retry + 1}/${maxRetries}`);
+      await new Promise(resolve => setTimeout(resolve, retryDelay));
+    }
 
-        if (response.ok) {
-          const identity = await response.json();
+    for (const host of hosts) {
+      for (const port of ports) {
+        try {
+          console.log(`Checking ${host}:${port}...`);
 
-          // Verify this is actually our server by checking the signature
-          if (identity.signature === "mcp-browser-connector-24x7") {
-            console.log(`Successfully found server at ${host}:${port}`);
+          // Use the identity endpoint for validation with improved timeout handling
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 second timeout
 
-            // Save the discovered connection
-            discoveredHost = host;
-            discoveredPort = port;
-            serverDiscovered = true;
+          try {
+            const response = await fetch(`http://${host}:${port}/.identity`, {
+              signal: controller.signal,
+              headers: {
+                'Accept': 'application/json',
+                'User-Agent': 'Browser-Tools-MCP/1.2.0'
+              }
+            });
 
-            return true;
+            clearTimeout(timeoutId);
+
+            if (response.ok) {
+              const identity = await response.json();
+
+              // Verify this is actually our server by checking the signature
+              if (identity.signature === "mcp-browser-connector-24x7") {
+                console.log(`Successfully found server at ${host}:${port}`);
+
+                // Save the discovered connection
+                discoveredHost = host;
+                discoveredPort = port;
+                serverDiscovered = true;
+
+                // Save the discovered configuration for future use
+                try {
+                  fs.writeFileSync(path.join(process.cwd(), ".port"), port.toString());
+                  fs.writeFileSync(path.join(process.cwd(), ".host"), host);
+                } catch (err) {
+                  console.error("Error saving discovered configuration:", err);
+                }
+
+                return true;
+              }
+            }
+          } catch (error) {
+            clearTimeout(timeoutId);
+            throw error;
+          }
+        } catch (error: any) {
+          // Log connection errors during discovery
+          if (error.name === 'AbortError') {
+            console.error(`Connection to ${host}:${port} timed out`);
+          } else {
+            console.error(`Error checking ${host}:${port}: ${error.message}`);
           }
         }
-      } catch (error: any) {
-        // Ignore connection errors during discovery
-        console.error(`Error checking ${host}:${port}: ${error.message}`);
       }
     }
   }
 
-  console.error("No server found during discovery");
+  console.error(`No server found during discovery after ${maxRetries} attempts`);
   return false;
 }
 
-// Wrapper function to ensure server connection before making requests
+// Wrapper function with improved error handling and connection management
 async function withServerConnection<T>(
   apiCall: () => Promise<T>
 ): Promise<T | any> {
-  // Attempt to discover server if not already discovered
-  if (!serverDiscovered) {
-    const discovered = await discoverServer();
-    if (!discovered) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Failed to discover browser connector server. Please ensure it's running.",
-          },
-        ],
-        isError: true,
-      };
-    }
-  }
+  const maxRetries = 2;
+  let retryCount = 0;
 
-  // Now make the actual API call with discovered host/port
-  try {
-    return await apiCall();
-  } catch (error: any) {
-    // If the request fails, try rediscovering the server once
-    console.error(
-      `API call failed: ${error.message}. Attempting rediscovery...`
-    );
-    serverDiscovered = false;
-
-    if (await discoverServer()) {
-      console.error("Rediscovery successful. Retrying API call...");
-      try {
-        // Retry the API call with the newly discovered connection
-        return await apiCall();
-      } catch (retryError: any) {
-        console.error(`Retry failed: ${retryError.message}`);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Error after reconnection attempt: ${retryError.message}`,
-            },
-          ],
-          isError: true,
-        };
+  while (retryCount <= maxRetries) {
+    try {
+      // Attempt to discover server if not already discovered
+      if (!serverDiscovered) {
+        const discovered = await discoverServer();
+        if (!discovered) {
+          if (retryCount < maxRetries) {
+            console.log(`Server discovery failed, attempt ${retryCount + 1}/${maxRetries}`);
+            retryCount++;
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds before retry
+            continue;
+          }
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Failed to discover browser connector server. Please ensure it's running.",
+              },
+            ],
+            isError: true,
+          };
+        }
       }
-    } else {
-      console.error("Rediscovery failed. Could not reconnect to server.");
+
+      // Now make the actual API call with discovered host/port
+      return await apiCall();
+    } catch (error: any) {
+      console.error(`API call failed: ${error.message}`);
+
+      if (retryCount < maxRetries) {
+        console.log(`Retrying operation, attempt ${retryCount + 1}/${maxRetries}`);
+        serverDiscovered = false; // Force rediscovery on next attempt
+        retryCount++;
+        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds before retry
+        continue;
+      }
+
       return {
         content: [
           {
             type: "text",
-            text: `Failed to reconnect to server: ${error.message}`,
+            text: `Operation failed after ${maxRetries} attempts: ${error.message}`,
           },
         ],
         isError: true,
